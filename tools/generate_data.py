@@ -15,7 +15,7 @@ python3 -m sglang.launch_server \
 	--port 30000 \
 	--dtype bfloat16
 
-2. Regenerate the dataset:
+2a. Regenerate from a local JSONL file:
 
 python tools/generate_data.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
@@ -25,6 +25,22 @@ python tools/generate_data.py \
     --temperature 0.8 \
     --input-file-path ./cache/dataset/sharegpt_train.jsonl \
     --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl
+
+2b. Regenerate from a HuggingFace dataset:
+
+python tools/generate_data.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --concurrency 128 \
+    --max-tokens 4096 \
+    --server-address localhost:30000 \
+    --temperature 0.8 \
+    --hf-dataset lmsys/lmsys-chat-1m \
+    --hf-split train \
+    --output-file-path ./cache/dataset/lmsys_regen.jsonl
+
+    Both ShareGPT (from/value) and OpenAI (role/content) conversation formats are
+    supported and normalized automatically. Use --hf-conversations-field if the
+    conversations column is not named "conversations" or "messages".
 """
 
 import argparse
@@ -35,6 +51,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from typing import Any, Dict, List
 
+from datasets import load_dataset
 from openai import OpenAI
 from tqdm import tqdm
 
@@ -86,7 +103,31 @@ def parse_arguments():
         default=64,
         help="Concurrent requests per server (default: 64)",
     )
-    parser.add_argument("--input-file-path", type=str, required=True, help="Path to the input file")
+    parser.add_argument("--input-file-path", type=str, default=None, help="Path to the input JSONL file")
+    parser.add_argument(
+        "--hf-dataset",
+        type=str,
+        default=None,
+        help="HuggingFace dataset name (alternative to --input-file-path)",
+    )
+    parser.add_argument(
+        "--hf-subset",
+        type=str,
+        default=None,
+        help="HuggingFace dataset subset/config name",
+    )
+    parser.add_argument(
+        "--hf-split",
+        type=str,
+        default="train",
+        help="HuggingFace dataset split (default: train)",
+    )
+    parser.add_argument(
+        "--hf-conversations-field",
+        type=str,
+        default=None,
+        help="Field name in HF dataset containing conversations (auto-detected if not specified)",
+    )
     parser.add_argument(
         "--output-file-path", type=str, required=True, help="Path to the output file"
     )
@@ -185,10 +226,7 @@ def call_sglang(args, server_address: str, data: Dict[str, Any], max_tokens=None
             total_output_tokens += resp.usage.completion_tokens
             resp_msg = {"role": "assistant", "content": resp.choices[0].message.content}
             if args.is_reasoning_model:
-                reasoning = getattr(resp.choices[0].message, "reasoning_content", None) or (
-                    resp.choices[0].message.model_extra or {}
-                ).get("reasoning")
-                resp_msg["thinking"] = reasoning
+                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"
@@ -231,6 +269,52 @@ def wait_for_healthy_servers(args) -> List[str]:
         time.sleep(5)
 
 
+_SHAREGPT_ROLE_MAP = {"human": "user", "gpt": "assistant", "system": "system", "tool": "tool"}
+
+
+def _normalize_conversations(convs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize conversations to role/content format, supporting ShareGPT and OpenAI formats."""
+    normalized = []
+    for msg in convs:
+        if "role" in msg and "content" in msg:
+            normalized.append({"role": msg["role"], "content": msg["content"]})
+        elif "from" in msg and "value" in msg:
+            role = _SHAREGPT_ROLE_MAP.get(msg["from"], msg["from"])
+            normalized.append({"role": role, "content": msg["value"]})
+        else:
+            raise ValueError(f"Unknown message format (expected role/content or from/value): {list(msg.keys())}")
+    return normalized
+
+
+def load_hf_dataset_records(args) -> List[Dict[str, Any]]:
+    """Load records from a HuggingFace dataset and normalize to the internal format."""
+    print(f"Loading HuggingFace dataset: {args.hf_dataset}" +
+          (f" (subset={args.hf_subset})" if args.hf_subset else "") +
+          f" [split={args.hf_split}]")
+    dataset = load_dataset(args.hf_dataset, args.hf_subset, split=args.hf_split)
+    print(f"Loaded {len(dataset)} samples from HuggingFace dataset.")
+
+    conv_field = args.hf_conversations_field
+    if conv_field is None:
+        for candidate in ("conversations", "messages"):
+            if candidate in dataset.column_names:
+                conv_field = candidate
+                break
+        if conv_field is None:
+            raise ValueError(
+                f"Cannot auto-detect conversations field from columns {dataset.column_names}. "
+                "Use --hf-conversations-field to specify it."
+            )
+    print(f"Using conversations field: '{conv_field}'")
+
+    records = []
+    for data_id, item in enumerate(dataset):
+        convs = _normalize_conversations(item[conv_field])
+        record = {"conversations": convs, "data_id": data_id}
+        records.append(record)
+    return records
+
+
 def load_checkpoint(output_file_path: str):
     """Load previously processed IDs and metrics from an existing output file."""
     processed_ids = set()
@@ -267,6 +351,9 @@ def load_checkpoint(output_file_path: str):
 def main():
     args = parse_arguments()
 
+    if (args.input_file_path is None and args.hf_dataset is None) or (args.input_file_path is not None and args.hf_dataset is not None):
+        raise ValueError("Must specify either --input-file-path or --hf-dataset")
+
     if not (0.0 <= args.temperature <= 2.0):
         raise ValueError("Temperature must be between 0.0 and 2.0")
     if args.max_tokens <= 0:
@@ -278,7 +365,10 @@ def main():
     print(f"  Concurrency: {args.concurrency}")
     print(f"  Temperature: {args.temperature}")
     print(f"  Servers: {args.server_address}")
-    print(f"  Input: {args.input_file_path}")
+    if args.hf_dataset:
+        print(f"  HF Dataset: {args.hf_dataset} (subset={args.hf_subset}, split={args.hf_split})")
+    else:
+        print(f"  Input: {args.input_file_path}")
     print(f"  Output: {args.output_file_path}")
 
     valid_servers = wait_for_healthy_servers(args)
@@ -291,8 +381,10 @@ def main():
         return
 
     remaining_data = []
-    with open(args.input_file_path, "r") as f:
-        for data_id, line in enumerate(f):
+    if args.hf_dataset:
+        all_records = load_hf_dataset_records(args)
+        for record in all_records:
+            data_id = record["data_id"]
             if data_id in processed_ids:
                 continue
             if (
@@ -300,9 +392,20 @@ def main():
                 and (success_count + len(remaining_data)) >= args.num_samples
             ):
                 break
-            data = json.loads(line.strip())
-            data["data_id"] = data_id
-            remaining_data.append(data)
+            remaining_data.append(record)
+    else:
+        with open(args.input_file_path, "r") as f:
+            for data_id, line in enumerate(f):
+                if data_id in processed_ids:
+                    continue
+                if (
+                    args.num_samples is not None
+                    and (success_count + len(remaining_data)) >= args.num_samples
+                ):
+                    break
+                data = json.loads(line.strip())
+                data["data_id"] = data_id
+                remaining_data.append(data)
 
     error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
     error_count = 0
